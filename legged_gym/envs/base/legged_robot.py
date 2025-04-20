@@ -169,6 +169,9 @@ class LeggedRobot(BaseTask):
         self.last_actions[:] = self.actions[:]
         self.last_dof_vel[:] = self.dof_vel[:]
         self.last_root_vel[:] = self.root_states[:, 7:13]
+        self.last_last_actions[:] = self.last_actions[:]
+        self.last_last_joint_pos_target[:] = self.last_joint_pos_target[:]
+        self.last_joint_pos_target[:] = self.joint_pos_target[:]
 
         if self.viewer and self.enable_viewer_sync and self.debug_viz:
             self._draw_debug_vis()
@@ -218,7 +221,12 @@ class LeggedRobot(BaseTask):
             self.randomized_d_gains[env_ids] = new_randomized_gains[1]
 
         # reset buffers
+        self.joint_pos_target[env_ids, :] = self.default_dof_pos
+        self.last_joint_pos_target[:] = self.joint_pos_target[:]
+        self.last_last_joint_pos_target[:] = self.last_joint_pos_target[:]
+
         self.last_actions[env_ids] = 0.
+        self.last_last_actions[env_ids] = 0.
         self.last_dof_vel[env_ids] = 0.
         self.feet_air_time[env_ids] = 0.
         self.episode_length_buf[env_ids] = 0
@@ -439,7 +447,9 @@ class LeggedRobot(BaseTask):
             d_gains = self.d_gains
 
         if control_type=="P":
-            torques = p_gains*(actions_scaled + self.default_dof_pos - self.dof_pos) - d_gains*self.dof_vel
+            self.joint_pos_target = actions_scaled + self.default_dof_pos
+            torques = self.p_gains * (
+                        self.joint_pos_target - self.dof_pos) - self.d_gains * self.dof_vel
         elif control_type=="V":
             torques = p_gains*(actions_scaled - self.dof_vel) - d_gains*(self.dof_vel - self.last_dof_vel)/self.sim_params.dt
         elif control_type=="T":
@@ -633,6 +643,19 @@ class LeggedRobot(BaseTask):
         if self.cfg.terrain.measure_heights:
             self.height_points = self._init_height_points()
         self.measured_heights = 0
+
+        self.last_dof_vel = torch.zeros_like(self.dof_vel)
+        self.last_last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device,
+                                             requires_grad=False)
+        self.last_last_dof_vel = torch.zeros_like(self.dof_vel)
+        self.joint_pos_target = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float,
+                                            device=self.device,
+                                            requires_grad=False)
+        self.last_joint_pos_target = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device,
+                                                 requires_grad=False)
+        self.last_last_joint_pos_target = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float,
+                                                      device=self.device,
+                                                      requires_grad=False)
 
         # joint positions offsets and PD gains
         self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
@@ -1060,3 +1083,22 @@ class LeggedRobot(BaseTask):
     def _reward_feet_contact_forces(self):
         # penalize high contact forces
         return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) -  self.cfg.rewards.max_contact_force).clip(min=0.), dim=1)
+
+    def _reward_action_smoothness_1(self):
+        # Penalize changes in actions
+        diff = torch.square(self.joint_pos_target - self.last_joint_pos_target)
+        diff = diff * (self.last_actions[:, :self.num_dof] != 0)  # ignore first step
+        return torch.sum(diff, dim=1)
+
+    def _reward_action_smoothness_2(self):
+        # Penalize changes in actions
+        diff = torch.square(self.joint_pos_target - 2 * self.last_joint_pos_target + self.last_last_joint_pos_target)
+        diff = diff * (self.last_actions != 0)  # ignore first step
+        diff = diff * (self.last_last_actions != 0)  # ignore second step
+        return torch.sum(diff, dim=1)
+
+    # def _reward_feet_slip(self):
+    #     contact_filt = torch.logical_or(self.feet_contact_states, self.last_feet_contact_states)
+    #     foot_velocities = torch.square(torch.norm(self.foot_velocities[:, :, 0:2], dim=2).view(self.num_envs, -1))
+    #     rew_slip = torch.sum(contact_filt * foot_velocities, dim=1)
+    #     return rew_slip
